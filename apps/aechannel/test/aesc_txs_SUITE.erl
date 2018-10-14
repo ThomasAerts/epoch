@@ -146,8 +146,6 @@
          fp_solo_payload_not_call_update/1,
          fp_solo_payload_broken_call/1,
          % poi tests
-         fp_missing_account_address/1,
-         fp_missing_contract_address/1,
 
          fp_insufficent_tokens/1,
          fp_too_soon/1
@@ -303,8 +301,6 @@ groups() ->
        fp_solo_payload_not_call_update,
        fp_solo_payload_broken_call,
        % poi tests
-       fp_missing_account_address,
-       fp_missing_contract_address,
 
        fp_insufficent_tokens,
        fp_too_soon
@@ -1936,7 +1932,14 @@ fp_after_solo_close(Cfg) ->
                                                 ContractCreateRound,
                                                 Owner),
                 set_prop(round, CloseRound),
+                fun(#{initiator_pubkey  := IPubkey,
+                      responder_pubkey  := RPubkey,
+                      trees             := Trees} = Props) ->
+                    PoI = calc_poi([IPubkey, RPubkey], [], Trees),
+                    Props#{poi => PoI}
+                end,
                 positive(fun close_solo_/2),
+                delete_prop(state_hash),
                 create_poi_by_trees(),
                 set_prop(round, FPRound - 1), % for the payload
                 create_payload(),
@@ -2004,6 +2007,12 @@ fp_after_slash(Cfg) ->
                                                 ContractCreateRound,
                                                 Owner),
                 set_prop(round, CloseRound),
+                fun(#{initiator_pubkey  := IPubkey,
+                      responder_pubkey  := RPubkey,
+                      trees             := Trees} = Props) ->
+                    PoI = calc_poi([IPubkey, RPubkey], [], Trees),
+                    Props#{poi => PoI}
+                end,
                 positive(fun close_solo_/2),
                 % slash
                 set_prop(height, SlashHeight),
@@ -2011,6 +2020,12 @@ fp_after_slash(Cfg) ->
                 set_from(Slasher),
                 delete_prop(state_hash),
                 create_poi_by_trees(),
+                fun(#{initiator_pubkey  := IPubkey,
+                      responder_pubkey  := RPubkey,
+                      trees             := Trees} = Props) ->
+                    PoI = calc_poi([IPubkey, RPubkey], [], Trees),
+                    Props#{poi => PoI}
+                end,
                 create_payload(),
                 positive(fun slash_/2),
                 % force progress
@@ -2729,81 +2744,6 @@ fp_solo_payload_broken_call(Cfg) ->
     TestWithCallData(<<42:42/unit:8>>),
     ok.
 
-fp_missing_account_address(Cfg) ->
-    Round = 43,
-    ContractRound = 10,
-    T =
-        fun(Owner, Forcer) ->
-            run(#{cfg => Cfg, initiator_amount => 30,
-                              responder_amount => 30,
-                 channel_reserve => 1},
-               [positive(fun create_channel_/2),
-                create_trees_if_not_present(),
-                set_from(Owner, owner, owner_privkey),
-                create_contract_in_trees(_Round    = ContractRound,
-                                          _Contract = "identity",
-                                          _InitArgs = <<"()">>,
-                                          _Deposit  = 2),
-                fun(Props) ->
-                    Skip =
-                        case Forcer of % forcer is required so we remove it
-                            initiator -> initiator_pubkey;
-                            responder -> responder_pubkey
-                        end,
-                    AddressToSkip = maps:get(Skip, Props),
-                    Props#{exclude_from_poi => [AddressToSkip]}
-                end,
-                create_poi_by_trees(),
-                set_prop(round, Round - 1),
-                create_payload(),
-                set_from(Forcer),
-                set_prop(round, Round),
-                fun(#{contract_id := ContractId} = Props) ->
-                    (create_contract_call_payload(ContractId, <<"main">>,
-                                                  <<"42">>, 1))(Props)
-                end,
-                negative_force_progress_sequence(Round, Forcer,
-                                                 incomplete_poi)])
-        end,
-    [T(Owner, Forcer) || Owner  <- ?ROLES,
-                         Forcer <- ?ROLES],
-    ok.
-
-fp_missing_contract_address(Cfg) ->
-    Round = 43,
-    ContractRound = 10,
-    T =
-        fun(Owner, Forcer) ->
-            run(#{cfg => Cfg, initiator_amount => 30,
-                              responder_amount => 30,
-                 channel_reserve => 1},
-               [positive(fun create_channel_/2),
-                create_trees_if_not_present(),
-                set_from(Owner, owner, owner_privkey),
-                create_contract_in_trees(_Round    = ContractRound,
-                                          _Contract = "identity",
-                                          _InitArgs = <<"()">>,
-                                          _Deposit  = 2),
-                fun(#{contract_id := ContractId} = Props) ->
-                    Props#{exclude_from_poi => [ContractId]}
-                end,
-                create_poi_by_trees(),
-                set_prop(round, Round - 1),
-                create_payload(),
-                set_from(Forcer),
-                set_prop(round, Round),
-                fun(#{contract_id := ContractId} = Props) ->
-                    (create_contract_call_payload(ContractId, <<"main">>,
-                                                  <<"42">>, 1))(Props)
-                end,
-                set_prop(fee, 1),
-                negative_force_progress_sequence(Round, Forcer,
-                                                incomplete_poi)])
-        end,
-    [T(Owner, Forcer) || Owner  <- ?ROLES,
-                         Forcer <- ?ROLES],
-    ok.
-
 fp_insufficent_tokens(Cfg) ->
     Round = 43,
     ContractRound = 10,
@@ -2891,6 +2831,10 @@ create_contract_poi_and_payload(Round, ContractRound, Owner, Opts) ->
                                     _InitArgs = ContractInitProps,
                                     _Deposit  = 2),
            create_poi_by_trees(),
+           fun(#{state_hash := PoiHash, trees := Trees} = Props) ->
+               ?assertEqual(PoiHash, aec_trees:hash(Trees)),
+               Props
+           end,
            set_prop(round, Round),
            fun(Props) ->
                case maps:get(fake_hash, Opts, none) of
@@ -2902,27 +2846,10 @@ create_contract_poi_and_payload(Round, ContractRound, Owner, Opts) ->
     end.
 
 create_poi_by_trees() ->
-    fun(#{initiator_pubkey := Initiator,
-          responder_pubkey := Responder,
-          contract_ids     := ContractIds0,
-          fake_account     := FakeAcc,
-          trees            := Trees} = Props) ->
-        IdsToDrop = maps:get(exclude_from_poi, Props, []),
-        DropSomeIds =
-            fun(List) ->
-                lists:foldl(
-                    fun lists:delete/2,
-                    List,
-                    IdsToDrop)
-            end,
-        Accounts = DropSomeIds([Initiator, Responder, FakeAcc]),
-        Contracts = DropSomeIds(ContractIds0),
-        PoI = calc_poi(Accounts, Contracts, Trees),
-        PoIHash = aec_trees:poi_hash(PoI),
-        Props#{state_hash => PoIHash, poi => PoI,
-               addresses => [aec_id:create(account, Acc) || Acc <- Accounts] ++
-                            [aec_id:create(contract, C) || C <- Contracts]
-              }
+    fun(#{trees := Trees} = Props) ->
+        PoI = Trees,
+        PoIHash = aec_trees:hash(PoI),
+        Props#{state_hash => PoIHash, poi => Trees}
     end.
 
 negative_force_progress_sequence(Round, Forcer, ErrMsg) ->
@@ -2949,6 +2876,10 @@ force_progress_sequence(Round, Forcer) ->
                                         {<<"main">>, <<"42">>}),
         run(Props0,
            [get_onchain_balances(before_force),
+            fun(#{state_hash := StateHash, poi := PoI} = Props) ->
+                ?assertEqual(StateHash, aec_trees:hash(PoI)),
+                Props
+            end,
             set_from(Forcer),
             set_prop(round, Round),
             fun(#{contract_id := ContractId} = Props) ->
@@ -3160,21 +3091,17 @@ tx_env(#{height := Height} = Props) ->
                           123456, KeyBlockHash).
 
 create_trees_if_not_present() ->
-    AccountHashSize = aec_base58c:byte_size_for_type(account_pubkey),
-    FakeAccount = <<42:AccountHashSize/unit:8>>,
-    FakeAmt = 3,
     fun(#{trees := _} = Props) -> Props; % trees are already present
        (#{initiator_amount  := IAmt,
           responder_amount  := RAmt,
           initiator_pubkey  := IPubkey,
           responder_pubkey  := RPubkey} = Props) ->
         Accounts = [aec_accounts:new(Pubkey, Balance) ||
-                {Pubkey, Balance} <- [{IPubkey, IAmt - FakeAmt},
-                                      {FakeAccount, FakeAmt}, % so there is something else besides those two accounts
+                {Pubkey, Balance} <- [{IPubkey, IAmt},
                                       {RPubkey, RAmt}
                                      ]],
         Trees = aec_test_utils:create_state_tree_with_accounts(Accounts, no_backend),
-        Props#{trees => Trees, fake_account => FakeAccount}
+        Props#{trees => Trees}
     end.
 
 create_contract_in_trees(CreationRound, ContractName, InitArg, Deposit) ->
@@ -3457,6 +3384,7 @@ snapshot_solo_(#{ channel_pubkey    := ChannelPubKey,
     apply_on_trees_(Props, SignedTx, S, Expected).
 
 force_progress_(#{channel_pubkey    := ChannelPubKey,
+                  poi               := PoI,
                   from_pubkey       := From,
                   from_privkey      := FromPrivkey,
                   fee               := Fee,
@@ -3465,8 +3393,6 @@ force_progress_(#{channel_pubkey    := ChannelPubKey,
                   solo_payload      := #{update     := Update,
                                          round      := Round,
                                          state_hash := StateHash},
-                  addresses         := Addresses, %HERE deleteme DOMAT
-                  poi               := PoI,
                   initiator_privkey := _IPrivkey,
                   responder_privkey := _RPrivkey} = Props, Expected) ->
 
